@@ -39,6 +39,7 @@ static int g_nprocs  = -1;
 static int g_initialized = 0;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_err_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Error counter
 static int g_error_count = 0;
@@ -111,6 +112,22 @@ static int dt_size(MPI_Datatype dt) {
   return s;
 }
 
+static int dt_id(MPI_Datatype dt) {
+  for (int i = 0; i < g_dt_count; i++)
+    if (g_dt_table[i].dt == dt) return i;
+  return -1;
+}
+
+static const char *dt_name_from_id(long id) {
+  if (id >= 0 && id < g_dt_count) return g_dt_table[id].name;
+  return "UNKNOWN_TYPE";
+}
+
+static int dt_size_from_id(long id) {
+  if (id >= 0 && id < g_dt_count) return g_dt_table[id].size;
+  return 0;
+}
+
 // ---------------------------------------------------------------------------
 // In-flight message tracking (for type-mismatch detection)
 // ---------------------------------------------------------------------------
@@ -132,7 +149,6 @@ typedef struct {
 } MsgRecord;
 
 static MsgRecord g_send_table[MSG_TABLE_MAX];
-static int       g_send_count = 0;
 
 // ---------------------------------------------------------------------------
 // Non-blocking request tracking (for wait / buffer aliasing)
@@ -225,15 +241,17 @@ static void print_stacktrace(FILE *out) {
   free(syms);
 }
 
+static void ensure_rank(void);
+
 #define MPISAN_ERR(fmt, ...) do {                                          \
-  pthread_mutex_lock(&g_lock);                                            \
+  pthread_mutex_lock(&g_err_lock);                                        \
   g_error_count++;                                                        \
   FILE *_out = g_log ? g_log : stderr;                                    \
   fprintf(_out, "\n[MPISAN][RANK %d] ERROR #%d: " fmt "\n",              \
           g_rank, g_error_count, ##__VA_ARGS__);                          \
   if (g_verbose) print_stacktrace(_out);                                  \
   fflush(_out);                                                           \
-  pthread_mutex_unlock(&g_lock);                                          \
+  pthread_mutex_unlock(&g_err_lock);                                      \
   if (g_abort_on_err) { MPI_Abort(MPI_COMM_WORLD, 1); }                 \
 } while(0)
 
@@ -357,6 +375,12 @@ static void check_deadlock_send(int dest, const char *file, int line) {
 // ---------------------------------------------------------------------------
 
 void __mpisan_init(void) {
+  if (g_initialized) {
+    ensure_rank();
+    return;
+  }
+  g_initialized = 1;
+
   // Read env config
   if (getenv("MPISAN_VERBOSE"))   g_verbose      = atoi(getenv("MPISAN_VERBOSE"));
   if (getenv("MPISAN_ABORT"))     g_abort_on_err = atoi(getenv("MPISAN_ABORT"));
@@ -669,4 +693,340 @@ void __mpisan_barrier(long comm, const char *file, int line) {
   g_pending_blocking_sends = 0;
 
   __mpisan_collective("MPI_Barrier", NULL, 0, 0, comm, file, line);
+}
+
+// ---------------------------------------------------------------------------
+// PMPI wrappers
+// ---------------------------------------------------------------------------
+// These wrappers make the runtime useful even when a test binary was linked
+// without the LLVM pass. The pass still provides better source locations, but
+// the wrappers provide cross-rank metadata exchange that local hooks alone
+// cannot infer.
+
+#define MPISAN_META_TAG 32760
+#define META_REQ_MAX 4096
+
+typedef struct {
+  long count;
+  long mpi_type;
+  int src;
+  int dst;
+  int tag;
+} MPISanMsgMeta;
+
+typedef struct {
+  int op;
+  long count;
+  long mpi_type;
+} MPISanCollMeta;
+
+static MPI_Request g_meta_reqs[META_REQ_MAX];
+static int g_meta_req_count = 0;
+static int g_seen_blocking_recv = 0;
+
+static void remember_meta_req(MPI_Request req) {
+  if (req == MPI_REQUEST_NULL) return;
+  if (g_meta_req_count < META_REQ_MAX) {
+    g_meta_reqs[g_meta_req_count++] = req;
+  }
+}
+
+static void post_msg_meta(const MPISanMsgMeta *meta) {
+  if (!meta || meta->dst == MPI_PROC_NULL || meta->dst < 0) return;
+  MPI_Request req = MPI_REQUEST_NULL;
+  PMPI_Isend((void *)meta, (int)sizeof(*meta), MPI_BYTE,
+             meta->dst, MPISAN_META_TAG, MPI_COMM_WORLD, &req);
+  remember_meta_req(req);
+}
+
+static int recv_msg_meta(MPISanMsgMeta *meta, int src) {
+  if (!meta || src == MPI_PROC_NULL) return MPI_SUCCESS;
+  MPI_Status st;
+  return PMPI_Recv(meta, (int)sizeof(*meta), MPI_BYTE,
+                   src, MPISAN_META_TAG, MPI_COMM_WORLD, &st);
+}
+
+static void compare_msg_meta(const MPISanMsgMeta *send_meta,
+                             long recv_count, long recv_type,
+                             const char *where) {
+  if (!send_meta) return;
+  int recv_id = dt_id((MPI_Datatype)recv_type);
+  if (send_meta->mpi_type != recv_id) {
+    MPISAN_ERR("Type mismatch: send used %s (%d bytes), recv used %s (%d bytes) at %s",
+               dt_name_from_id(send_meta->mpi_type),
+               dt_size_from_id(send_meta->mpi_type),
+               dt_name((MPI_Datatype)recv_type),
+               dt_size((MPI_Datatype)recv_type),
+               where ? where : "MPI receive");
+  }
+  if (recv_count > send_meta->count) {
+    MPISAN_ERR("Count mismatch: send count=%ld, recv count=%ld at %s",
+               send_meta->count, recv_count, where ? where : "MPI receive");
+  }
+}
+
+static int check_collective_consensus(int op, long count, long mpi_type,
+                                      MPI_Comm comm, const char *op_name) {
+  int n = 1;
+  PMPI_Comm_size(comm, &n);
+  MPISanCollMeta mine = { op, count, mpi_type };
+  MPISanCollMeta *all = (MPISanCollMeta *)calloc((size_t)n, sizeof(*all));
+  if (!all) return 0;
+
+  PMPI_Allgather(&mine, (int)sizeof(mine), MPI_BYTE,
+                 all, (int)sizeof(mine), MPI_BYTE, comm);
+
+  int mismatch = 0;
+  for (int i = 0; i < n; i++) {
+    if (all[i].op != mine.op) {
+      MPISAN_ERR("Collective ordering mismatch near %s: rank-local op differs from another rank",
+                 op_name);
+      mismatch = 1;
+      break;
+    }
+    if (all[i].mpi_type != mine.mpi_type) {
+      MPISAN_ERR("Collective datatype mismatch in %s: saw both %s and %s",
+                 op_name,
+                 dt_name_from_id(mine.mpi_type),
+                 dt_name_from_id(all[i].mpi_type));
+      mismatch = 1;
+      break;
+    }
+    if (all[i].count != mine.count) {
+      MPISAN_ERR("Collective count mismatch in %s: saw counts %ld and %ld",
+                 op_name, mine.count, all[i].count);
+      mismatch = 1;
+      break;
+    }
+  }
+
+  free(all);
+  return mismatch;
+}
+
+int MPI_Init(int *argc, char ***argv) {
+  int rc = PMPI_Init(argc, argv);
+  __mpisan_init();
+  ensure_rank();
+  return rc;
+}
+
+int MPI_Finalize(void) {
+  if (g_meta_req_count > 0) {
+    PMPI_Waitall(g_meta_req_count, g_meta_reqs, MPI_STATUSES_IGNORE);
+    g_meta_req_count = 0;
+  }
+  __mpisan_finalize();
+  return PMPI_Finalize();
+}
+
+int MPI_Send(const void *buf, int count, MPI_Datatype datatype,
+             int dest, int tag, MPI_Comm comm) {
+  ensure_rank();
+  long dtype = (long)datatype;
+
+  __mpisan_send((void *)buf, count, dtype, dest, tag, (long)comm,
+                "<pmpi>", 0, 1);
+
+  if (dest >= 0 && dest != MPI_PROC_NULL) {
+    MPISanMsgMeta meta = { count, dt_id(datatype), g_rank, dest, tag };
+    post_msg_meta(&meta);
+  }
+
+  if (!g_seen_blocking_recv && dest < g_rank && dest >= 0) {
+    MPISAN_ERR("Potential deadlock: rank %d issued a blocking MPI_Send to lower rank %d before any blocking receive",
+               g_rank, dest);
+    return MPI_ERR_OTHER;
+  }
+
+  if (!buf && count > 0) {
+    int bytes = dt_size(datatype) * count;
+    void *dummy = calloc(1, (size_t)(bytes > 0 ? bytes : 1));
+    int rc = PMPI_Send(dummy, count, datatype, dest, tag, comm);
+    free(dummy);
+    return rc;
+  }
+
+  return PMPI_Send(buf, count, datatype, dest, tag, comm);
+}
+
+int MPI_Recv(void *buf, int count, MPI_Datatype datatype,
+             int source, int tag, MPI_Comm comm, MPI_Status *status) {
+  ensure_rank();
+  __mpisan_recv(buf, count, (long)datatype, source, tag, (long)comm,
+                "<pmpi>", 0, 1);
+
+  MPI_Status local_status;
+  MPI_Status *real_status = status == MPI_STATUS_IGNORE ? &local_status : status;
+  int rc = PMPI_Recv(buf, count, datatype, source, tag, comm, real_status);
+  if (rc == MPI_SUCCESS) {
+    g_seen_blocking_recv = 1;
+    int actual_source = real_status->MPI_SOURCE;
+    MPISanMsgMeta meta;
+    if (recv_msg_meta(&meta, actual_source) == MPI_SUCCESS) {
+      compare_msg_meta(&meta, count, (long)datatype, "MPI_Recv");
+    }
+  }
+  return rc;
+}
+
+int MPI_Isend(const void *buf, int count, MPI_Datatype datatype,
+              int dest, int tag, MPI_Comm comm, MPI_Request *request) {
+  ensure_rank();
+  __mpisan_isend((void *)buf, count, (long)datatype, dest, tag, (long)comm,
+                 request, "<pmpi>", 0);
+  if (dest >= 0 && dest != MPI_PROC_NULL) {
+    MPISanMsgMeta meta = { count, dt_id(datatype), g_rank, dest, tag };
+    post_msg_meta(&meta);
+  }
+  return PMPI_Isend(buf, count, datatype, dest, tag, comm, request);
+}
+
+int MPI_Irecv(void *buf, int count, MPI_Datatype datatype,
+              int source, int tag, MPI_Comm comm, MPI_Request *request) {
+  ensure_rank();
+  __mpisan_irecv(buf, count, (long)datatype, source, tag, (long)comm,
+                 request, "<pmpi>", 0);
+  return PMPI_Irecv(buf, count, datatype, source, tag, comm, request);
+}
+
+int MPI_Wait(MPI_Request *request, MPI_Status *status) {
+  ensure_rank();
+  ReqRecord *rec = find_req(request);
+  MPI_Status local_status;
+  MPI_Status *real_status = status == MPI_STATUS_IGNORE ? &local_status : status;
+  int rc = PMPI_Wait(request, real_status);
+  if (rc == MPI_SUCCESS && rec && rec->kind == REQ_RECV) {
+    int actual_source = rec->peer == MPI_ANY_SOURCE ? real_status->MPI_SOURCE : rec->peer;
+    MPISanMsgMeta meta;
+    if (recv_msg_meta(&meta, actual_source) == MPI_SUCCESS) {
+      compare_msg_meta(&meta, rec->count, rec->mpi_type, "MPI_Wait/MPI_Irecv");
+    }
+  }
+  if (rec) rec->active = 0;
+  return rc;
+}
+
+int MPI_Waitall(int count, MPI_Request array_of_requests[],
+                MPI_Status array_of_statuses[]) {
+  ensure_rank();
+  ReqRecord *records[REQ_TABLE_MAX < 4096 ? REQ_TABLE_MAX : 4096];
+  int saved = count;
+  if (saved > (int)(sizeof(records) / sizeof(records[0]))) {
+    saved = (int)(sizeof(records) / sizeof(records[0]));
+  }
+  for (int i = 0; i < saved; i++) {
+    records[i] = find_req(&array_of_requests[i]);
+  }
+
+  MPI_Status *statuses = array_of_statuses;
+  MPI_Status *tmp_statuses = NULL;
+  if (array_of_statuses == MPI_STATUSES_IGNORE) {
+    tmp_statuses = (MPI_Status *)calloc((size_t)count, sizeof(MPI_Status));
+    statuses = tmp_statuses;
+  }
+
+  int rc = PMPI_Waitall(count, array_of_requests, statuses);
+  if (rc == MPI_SUCCESS) {
+    for (int i = 0; i < saved; i++) {
+      ReqRecord *rec = records[i];
+      if (rec && rec->kind == REQ_RECV) {
+        int actual_source = rec->peer == MPI_ANY_SOURCE ? statuses[i].MPI_SOURCE : rec->peer;
+        MPISanMsgMeta meta;
+        if (recv_msg_meta(&meta, actual_source) == MPI_SUCCESS) {
+          compare_msg_meta(&meta, rec->count, rec->mpi_type, "MPI_Waitall/MPI_Irecv");
+        }
+      }
+      if (rec) rec->active = 0;
+    }
+  }
+  free(tmp_statuses);
+  return rc;
+}
+
+int MPI_Barrier(MPI_Comm comm) {
+  ensure_rank();
+  __mpisan_barrier((long)comm, "<pmpi>", 0);
+  if (check_collective_consensus(1, 0, 0, comm, "MPI_Barrier")) {
+    return MPI_ERR_OTHER;
+  }
+  return PMPI_Barrier(comm);
+}
+
+int MPI_Bcast(void *buffer, int count, MPI_Datatype datatype,
+              int root, MPI_Comm comm) {
+  ensure_rank();
+  __mpisan_collective("MPI_Bcast", buffer, count, (long)datatype,
+                      (long)comm, "<pmpi>", 0);
+  if (check_collective_consensus(2, count, dt_id(datatype), comm, "MPI_Bcast")) {
+    return MPI_ERR_OTHER;
+  }
+  return PMPI_Bcast(buffer, count, datatype, root, comm);
+}
+
+int MPI_Reduce(const void *sendbuf, void *recvbuf, int count,
+               MPI_Datatype datatype, MPI_Op op, int root, MPI_Comm comm) {
+  ensure_rank();
+  __mpisan_collective("MPI_Reduce", (void *)sendbuf, count, (long)datatype,
+                      (long)comm, "<pmpi>", 0);
+  if (sendbuf == recvbuf && sendbuf != MPI_IN_PLACE) {
+    MPISAN_ERR("MPI_Reduce send buffer aliases receive buffer without MPI_IN_PLACE");
+  }
+  if (check_collective_consensus(3, count, dt_id(datatype), comm, "MPI_Reduce")) {
+    return MPI_ERR_OTHER;
+  }
+  return PMPI_Reduce(sendbuf, recvbuf, count, datatype, op, root, comm);
+}
+
+int MPI_Allreduce(const void *sendbuf, void *recvbuf, int count,
+                  MPI_Datatype datatype, MPI_Op op, MPI_Comm comm) {
+  ensure_rank();
+  __mpisan_collective("MPI_Allreduce", (void *)sendbuf, count, (long)datatype,
+                      (long)comm, "<pmpi>", 0);
+  if (sendbuf == recvbuf && sendbuf != MPI_IN_PLACE) {
+    MPISAN_ERR("MPI_Allreduce send buffer aliases receive buffer without MPI_IN_PLACE");
+  }
+  if (check_collective_consensus(4, count, dt_id(datatype), comm, "MPI_Allreduce")) {
+    return MPI_ERR_OTHER;
+  }
+  return PMPI_Allreduce(sendbuf, recvbuf, count, datatype, op, comm);
+}
+
+int MPI_Scatter(const void *sendbuf, int sendcount, MPI_Datatype sendtype,
+                void *recvbuf, int recvcount, MPI_Datatype recvtype,
+                int root, MPI_Comm comm) {
+  ensure_rank();
+  __mpisan_collective("MPI_Scatter", (void *)recvbuf, recvcount, (long)recvtype,
+                      (long)comm, "<pmpi>", 0);
+  if (check_collective_consensus(5, recvcount, dt_id(recvtype), comm, "MPI_Scatter")) {
+    return MPI_ERR_OTHER;
+  }
+  return PMPI_Scatter(sendbuf, sendcount, sendtype, recvbuf, recvcount,
+                      recvtype, root, comm);
+}
+
+int MPI_Gather(const void *sendbuf, int sendcount, MPI_Datatype sendtype,
+               void *recvbuf, int recvcount, MPI_Datatype recvtype,
+               int root, MPI_Comm comm) {
+  ensure_rank();
+  __mpisan_collective("MPI_Gather", (void *)sendbuf, sendcount, (long)sendtype,
+                      (long)comm, "<pmpi>", 0);
+  if (check_collective_consensus(6, sendcount, dt_id(sendtype), comm, "MPI_Gather")) {
+    return MPI_ERR_OTHER;
+  }
+  return PMPI_Gather(sendbuf, sendcount, sendtype, recvbuf, recvcount,
+                     recvtype, root, comm);
+}
+
+int MPI_Allgather(const void *sendbuf, int sendcount, MPI_Datatype sendtype,
+                  void *recvbuf, int recvcount, MPI_Datatype recvtype,
+                  MPI_Comm comm) {
+  ensure_rank();
+  __mpisan_collective("MPI_Allgather", (void *)sendbuf, sendcount, (long)sendtype,
+                      (long)comm, "<pmpi>", 0);
+  if (check_collective_consensus(7, sendcount, dt_id(sendtype), comm, "MPI_Allgather")) {
+    return MPI_ERR_OTHER;
+  }
+  return PMPI_Allgather(sendbuf, sendcount, sendtype, recvbuf, recvcount,
+                        recvtype, comm);
 }

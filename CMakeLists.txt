@@ -24,9 +24,24 @@ link_directories(${LLVM_LIBRARY_DIRS})
 # ---------------------------------------------------------------------------
 # Find MPI
 # ---------------------------------------------------------------------------
-find_package(MPI REQUIRED)
-message(STATUS "MPI include: ${MPI_C_INCLUDE_DIRS}")
-message(STATUS "MPI libs: ${MPI_C_LIBRARIES}")
+find_program(MPISAN_MPICC_EXECUTABLE mpicc REQUIRED)
+execute_process(
+    COMMAND ${MPISAN_MPICC_EXECUTABLE} --showme:compile
+    OUTPUT_VARIABLE MPI_C_COMPILE_FLAGS
+    ERROR_QUIET
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+execute_process(
+    COMMAND ${MPISAN_MPICC_EXECUTABLE} --showme:link
+    OUTPUT_VARIABLE MPI_C_LINK_FLAGS
+    ERROR_QUIET
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+separate_arguments(MPI_C_COMPILE_FLAGS_LIST UNIX_COMMAND "${MPI_C_COMPILE_FLAGS}")
+separate_arguments(MPI_C_LINK_FLAGS_LIST UNIX_COMMAND "${MPI_C_LINK_FLAGS}")
+message(STATUS "MPI compiler: ${MPISAN_MPICC_EXECUTABLE}")
+message(STATUS "MPI compile flags: ${MPI_C_COMPILE_FLAGS}")
+message(STATUS "MPI link flags: ${MPI_C_LINK_FLAGS}")
 
 # ---------------------------------------------------------------------------
 # LLVM Pass (shared plugin)
@@ -54,10 +69,10 @@ add_library(mpisan_rt STATIC
 )
 target_include_directories(mpisan_rt PRIVATE
     src/runtime
-    ${MPI_C_INCLUDE_DIRS}
 )
+target_compile_options(mpisan_rt PRIVATE ${MPI_C_COMPILE_FLAGS_LIST})
 target_link_libraries(mpisan_rt
-    ${MPI_C_LIBRARIES}
+    ${MPI_C_LINK_FLAGS_LIST}
     pthread
 )
 target_compile_options(mpisan_rt PRIVATE -g -O0)
@@ -68,10 +83,10 @@ add_library(mpisan_rt_shared SHARED
 )
 target_include_directories(mpisan_rt_shared PRIVATE
     src/runtime
-    ${MPI_C_INCLUDE_DIRS}
 )
+target_compile_options(mpisan_rt_shared PRIVATE ${MPI_C_COMPILE_FLAGS_LIST})
 target_link_libraries(mpisan_rt_shared
-    ${MPI_C_LIBRARIES}
+    ${MPI_C_LINK_FLAGS_LIST}
     pthread
 )
 set_target_properties(mpisan_rt_shared PROPERTIES OUTPUT_NAME "mpisan_rt")

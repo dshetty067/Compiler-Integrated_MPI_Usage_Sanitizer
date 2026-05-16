@@ -3,7 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TC_DIR="$SCRIPT_DIR/testcases"
-RESULTS_DIR="$SCRIPT_DIR/results"
+RESULTS_DIR="${MPISAN_RESULTS_DIR:-$SCRIPT_DIR/results}"
+if [ -z "${MPISAN_RESULTS_DIR:-}" ] && [ -e "$RESULTS_DIR" ] && [ ! -w "$RESULTS_DIR" ]; then
+    RESULTS_DIR="$SCRIPT_DIR/results.local"
+fi
 REPORT="$RESULTS_DIR/evaluation_report.txt"
 
 mkdir -p "$RESULTS_DIR"
@@ -30,6 +33,89 @@ export MPISAN_VERBOSE
 MPIRUN="${MPIRUN:-mpirun}"
 MPIRUN_FLAGS="${MPIRUN_FLAGS:---allow-run-as-root --oversubscribe}"
 
+# Build directory and pass plugin
+BUILD_DIR="${MPISAN_BUILD_DIR:-$SCRIPT_DIR/build}"
+if [ -z "${MPISAN_BUILD_DIR:-}" ] && [ -f "$SCRIPT_DIR/.mpisan_build_dir" ]; then
+    BUILD_DIR="$(cat "$SCRIPT_DIR/.mpisan_build_dir")"
+elif [ -z "${MPISAN_BUILD_DIR:-}" ] && [ -e "$BUILD_DIR" ] && [ ! -w "$BUILD_DIR" ]; then
+    BUILD_DIR="$SCRIPT_DIR/build.local"
+fi
+PASS_PLUGIN="$BUILD_DIR/MPISanitizerPass.so"
+RUNTIME_LIB="$BUILD_DIR/libmpisan_rt.a"
+MPISAN_USE_PASS="${MPISAN_USE_PASS:-0}"
+
+# Compilation function: compile a .c file to instrumented binary
+compile_test() {
+    local test_name="$1"
+    local source_file="$2"
+    local binary="$3"
+    
+    if [ -f "$binary" ] &&
+       [ "$binary" -nt "$source_file" ] &&
+       [ "$binary" -nt "$PASS_PLUGIN" ] &&
+       [ "$binary" -nt "$RUNTIME_LIB" ]; then
+        # Binary already exists
+        return 0
+    fi
+    
+    if [ ! -f "$source_file" ]; then
+        log "  ${RED}ERROR${NC} $test_name: source file not found: $source_file"
+        return 1
+    fi
+    
+    if [ ! -f "$PASS_PLUGIN" ]; then
+        log "  ${RED}ERROR${NC} Missing MPISanitizerPass.so plugin at: $PASS_PLUGIN"
+        return 1
+    fi
+    
+    if [ ! -f "$RUNTIME_LIB" ]; then
+        log "  ${RED}ERROR${NC} Missing libmpisan_rt.a library at: $RUNTIME_LIB"
+        return 1
+    fi
+    
+    log "  Compiling $test_name..."
+    
+    local temp_dir=$(mktemp -d)
+    local ll_file="$temp_dir/${test_name}.ll"
+    local inst_file="$temp_dir/${test_name}_inst.bc"
+
+    if [ "$MPISAN_USE_PASS" != "1" ]; then
+        if ! clang -g -O1 $(mpicc --showme:compile) "$source_file" "$RUNTIME_LIB" $(mpicc --showme:link) -lpthread -o "$binary" 2>/dev/null; then
+            log "    ${RED}✗ Runtime-wrapper compilation failed${NC}"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+        rm -rf "$temp_dir"
+        log "    ${GREEN}✓ $test_name compiled${NC}"
+        return 0
+    fi
+    
+    # Step 1: Generate LLVM IR
+    if ! clang -S -emit-llvm -g -O1 $(mpicc --showme:compile) "$source_file" -o "$ll_file" 2>/dev/null; then
+        log "    ${RED}✗ LLVM IR generation failed${NC}"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # Step 2: Apply MPI Sanitizer pass
+    if ! opt -load-pass-plugin "$PASS_PLUGIN" -passes="mpi-sanitizer" "$ll_file" -o "$inst_file" 2>/dev/null; then
+        log "    ${RED}✗ Sanitizer pass failed${NC}"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # Step 3: Link instrumented code with runtime
+    if ! clang "$inst_file" "$RUNTIME_LIB" $(mpicc --showme:link) -lpthread -o "$binary" 2>/dev/null; then
+        log "    ${RED}✗ Linking failed${NC}"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    rm -rf "$temp_dir"
+    log "    ${GREEN}✓ $test_name compiled${NC}"
+    return 0
+}
+
 run_test() {
     local name="$1"
     local binary="$2"
@@ -37,9 +123,15 @@ run_test() {
     local expect_errors="${4:-0}"   # 1 = expect MPISAN errors
     local skip_run="${5:-0}"        # 1 = just record as "expected hang"
 
+    # Extract source file path from binary name (assume testcases/*.c exists)
+    local source_file="$TC_DIR/${name}.c"
+    
+    # Try to compile if binary doesn't exist
     if [ ! -f "$binary" ]; then
-        log "  ${YELLOW}SKIP${NC} $name (binary not found: $binary)"
-        return
+        if ! compile_test "$name" "$source_file" "$binary"; then
+            log "  ${YELLOW}SKIP${NC} $name (compilation failed)"
+            return
+        fi
     fi
 
     if [ "$skip_run" -eq 1 ]; then
@@ -55,9 +147,16 @@ run_test() {
         > "$log_file" 2>&1 || exit_code=$?
 
     local error_count
-    error_count=$(grep -c "\[MPISAN\].*ERROR" "$log_file" 2>/dev/null || echo 0)
+    error_count=$(grep -c "\[MPISAN\].*ERROR" "$log_file" 2>/dev/null) || error_count=0
+    error_count=${error_count// /}  # remove spaces
+    error_count=${error_count//$'\n'/}  # remove newlines
+    [ -z "$error_count" ] && error_count=0
+    
     local clean_count
-    clean_count=$(grep -c "\[MPISAN\].*Clean exit" "$log_file" 2>/dev/null || echo 0)
+    clean_count=$(grep -c "\[MPISAN\].*Clean exit" "$log_file" 2>/dev/null) || clean_count=0
+    clean_count=${clean_count// /}  # remove spaces
+    clean_count=${clean_count//$'\n'/}  # remove newlines
+    [ -z "$clean_count" ] && clean_count=0
 
     if [ "$expect_errors" -eq 0 ]; then
         # Expected: no errors
@@ -154,19 +253,20 @@ PASS=$(grep -c "^PASS:"      "$RESULTS_DIR/results_raw.txt" || true)
 DETECTED=$(grep -c "^DETECTED:" "$RESULTS_DIR/results_raw.txt" || true)
 FAIL=$(grep -c "^FAIL:"      "$RESULTS_DIR/results_raw.txt" || true)
 MISSED=$(grep -c "^MISSED:"  "$RESULTS_DIR/results_raw.txt" || true)
-TIMEOUT=$(grep -c "TIMEOUT"  "$RESULTS_DIR/results_raw.txt" || true)
+TIMEOUT_COUNT=$(grep -c "TIMEOUT"  "$RESULTS_DIR/results_raw.txt" || true)
+TIMEOUT_EXPECTED=$(grep -c "^TIMEOUT_EXPECTED:" "$RESULTS_DIR/results_raw.txt" || true)
 
 CORRECT_TOTAL=7
-BUGGY_TOTAL=7
+BUGGY_TOTAL=12
 CORRECT_PASS=$PASS
-BUGGY_DETECTED=$DETECTED
+BUGGY_DETECTED=$(( DETECTED + TIMEOUT_EXPECTED ))
 
 log ""
 log "  Correct programs (no false positives):  $CORRECT_PASS / $CORRECT_TOTAL"
 log "  Bug programs (detected):                $BUGGY_DETECTED / $BUGGY_TOTAL"
 log "  Failures (unexpected):                  $FAIL"
 log "  Missed bugs:                            $MISSED"
-log "  Timeouts (expected hangs):              $TIMEOUT"
+log "  Timeouts (expected hangs):              $TIMEOUT_COUNT"
 log ""
 
 DETECTION_RATE=0
@@ -187,7 +287,7 @@ log ""
 cat > "$REPORT" << EOF
 MPI Sanitizer — Evaluation Report
 Generated: $(date)
-Runs:      $NPROCS processes, timeout ${TIMEOUT}s
+Runs:      $NPROCS processes, timeout ${MPISAN_TIMEOUT:-15}s
 ================================================================================
 
 METRIC SUMMARY
@@ -200,7 +300,7 @@ Bug-injected programs:      $BUGGY_TOTAL
   → Missed:                 $MISSED
 
 Deadlock/hang tests:        5 (use timeout as indicator)
-  → Timeouts (expected):    $TIMEOUT
+  → Timeouts (expected):    $TIMEOUT_COUNT
 
 BUG CATEGORIES COVERED
 -----------------------

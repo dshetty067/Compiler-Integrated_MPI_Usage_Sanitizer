@@ -1,0 +1,56 @@
+# Build artifacts
+/build/
+/build.local/
+/.mpisan_build_dir
+/CMakeFiles/
+/CMakeCache.txt
+/Makefile
+/compile_commands.json
+/cmake_install.cmake
+/InstallManifest.txt
+/Test/**
+
+# Installed headers and libraries
+/install/
+/install.local/
+
+# Runtime/results output
+/results/
+/results.local/
+
+# Test binaries
+/testcases/t[0-9][0-9]_*
+!/testcases/*.c
+/testcases/miniapp_heat1d_clean
+/testcases/miniapp_heat1d_buggy
+
+# Temporary files
+*.o
+*.obj
+*.so
+*.a
+*.dylib
+*.exe
+*.out
+*.log
+*~
+*.swp
+*.swo
+*.tmp
+*.bak
+
+# Editor/project settings
+.vscode/
+.idea/
+*.code-workspace
+
+# LLVM / instrumented files not required
+*.ll
+*_inst.ll
+*_instrumented
+
+# Shell history / environment
+.env
+
+# Misc
+.DS_Store

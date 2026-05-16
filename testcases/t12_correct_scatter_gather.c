@@ -19,11 +19,15 @@ int main(int argc, char **argv) {
     MPI_Scatter(sendbuf, 1, MPI_INT, &recvbuf, 1, MPI_INT, 0, MPI_COMM_WORLD);
     printf("[Rank %d] Scattered value: %d\n", rank, recvbuf);
 
-    int gathered = 0;
-    MPI_Gather(&recvbuf, 1, MPI_INT, &gathered, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    if (rank == 0) printf("[Rank 0] Gathered[0]=%d\n", gathered);
+    int *gathered = NULL;
+    if (rank == 0) {
+        gathered = (int*)malloc(size * sizeof(int));
+    }
+    MPI_Gather(&recvbuf, 1, MPI_INT, gathered, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (rank == 0) printf("[Rank 0] Gathered[0]=%d\n", gathered[0]);
 
     free(sendbuf);
+    free(gathered);
     MPI_Finalize();
     return 0;
 }

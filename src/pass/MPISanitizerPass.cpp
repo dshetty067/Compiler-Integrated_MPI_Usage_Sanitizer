@@ -136,21 +136,27 @@ Value *MPISanitizerPass::castToI64(Value *V, IRBuilder<> &B) {
 // ---------------------------------------------------------------------------
 
 static std::pair<std::string, int> getDebugLoc(CallInst *CI) {
-  if (auto &DL = CI->getDebugLoc()) {
-    if (auto *Scope = DL.get()) {
-      std::string file = "<unknown>";
-      if (auto *DIFile = dyn_cast_or_null<DIFile>(
-              cast<DIScope>(Scope)->getFile())) {
-        file = DIFile->getFilename().str();
-      } else {
-        // Try to get from scope directly
-        if (auto *SP = dyn_cast<DISubprogram>(cast<DIScope>(Scope))) {
-          if (SP->getFile()) file = SP->getFile()->getFilename().str();
+  if (auto DL = CI->getDebugLoc()) {
+    auto *scopeMeta = DL.get();
+    std::string file = "<unknown>";
+
+    // Safely cast to DIScope
+    if (auto *scope = dyn_cast<DIScope>(scopeMeta)) {
+      // Try direct file from scope
+      if (auto *diFileObj = scope->getFile()) {
+        file = diFileObj->getFilename().str();
+      } 
+      // Fallback: try subprogram
+      else if (auto *SP = dyn_cast<DISubprogram>(scope)) {
+        if (SP->getFile()) {
+          file = SP->getFile()->getFilename().str();
         }
       }
-      return {file, (int)DL.getLine()};
     }
+
+    return {file, (int)DL.getLine()};
   }
+
   return {"<unknown>", 0};
 }
 
