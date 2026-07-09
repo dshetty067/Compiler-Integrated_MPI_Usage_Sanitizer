@@ -17,6 +17,8 @@
 # Runtime/results output
 /results/
 /results.local/
+/custom_results/
+/custom_results.local/
 
 # Test binaries
 /testcases/t[0-9][0-9]_*

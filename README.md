@@ -16,6 +16,24 @@ chmod +x build.sh run.sh
 
 Requires Ubuntu 20.04+ with apt access (Docker-friendly). All dependencies are installed automatically by `build.sh`.
 
+## Run Your Own MPI Program
+
+Paste your MPI C code into `test.c`, then run:
+
+```bash
+./run_custom.sh
+```
+
+You can also pass another source file and process count:
+
+```bash
+./run_custom.sh path/to/my_program.c 4
+```
+
+The script compiles the program with the MPI Sanitizer LLVM pass, links it with
+`libmpisan_rt.a`, runs it with `mpirun`, and prints whether MPISAN detected any
+errors. Logs are written to `custom_results/custom_run.log`.
+
 ---
 
 ## What It Detects

@@ -856,15 +856,25 @@ int MPI_Recv(void *buf, int count, MPI_Datatype datatype,
   __mpisan_recv(buf, count, (long)datatype, source, tag, (long)comm,
                 "<pmpi>", 0, 1);
 
+  MPISanMsgMeta meta;
+  int have_meta = 0;
+  if (source != MPI_PROC_NULL) {
+    if (recv_msg_meta(&meta, source) == MPI_SUCCESS) {
+      compare_msg_meta(&meta, count, (long)datatype, "MPI_Recv");
+      have_meta = 1;
+    }
+  }
+
   MPI_Status local_status;
   MPI_Status *real_status = status == MPI_STATUS_IGNORE ? &local_status : status;
   int rc = PMPI_Recv(buf, count, datatype, source, tag, comm, real_status);
   if (rc == MPI_SUCCESS) {
     g_seen_blocking_recv = 1;
-    int actual_source = real_status->MPI_SOURCE;
-    MPISanMsgMeta meta;
-    if (recv_msg_meta(&meta, actual_source) == MPI_SUCCESS) {
-      compare_msg_meta(&meta, count, (long)datatype, "MPI_Recv");
+    if (!have_meta) {
+      int actual_source = real_status->MPI_SOURCE;
+      if (recv_msg_meta(&meta, actual_source) == MPI_SUCCESS) {
+        compare_msg_meta(&meta, count, (long)datatype, "MPI_Recv");
+      }
     }
   }
   return rc;
