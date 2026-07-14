@@ -54,3 +54,5 @@
 
 # Misc
 .DS_Store
+
+.venv/
